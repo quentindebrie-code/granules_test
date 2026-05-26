@@ -200,7 +200,7 @@ if cp_input:
             <strong>❌ Code postal {cp} non référencé</strong><br>
             <span style="font-size:.88rem; color:#666; margin-top:6px; display:block;">
             Ce code postal ne fait pas partie des zones de livraison actuellement configurées.<br>
-            Contactez la responsable granulés pour vérification.
+            Contactez-nous au 05 61 70 03 27 et nous étudierons votre demande dans les 24 heures.
             </span>
         </div>
         """, unsafe_allow_html=True)
