@@ -1,2 +1,7 @@
 streamlit>=1.36
 requests>=2.31
+pandas>=2.0
+numpy>=1.24
+matplotlib>=3.7
+openpyxl>=3.1
+fpdf2>=2.7
