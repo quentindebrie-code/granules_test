@@ -1068,6 +1068,56 @@ def lire_historique_classeur(source,
     return ok, rejets + avert
 
 
+def extraire_palettes(dfp: pd.DataFrame, taux: float, base: str) -> dict:
+    """Lit le tableau d'édition des palettes -> {nom: {'ht':…, 'ttc':…}}."""
+    out = {}
+    col = f"Prix {base}"
+    if dfp is None or dfp.empty or col not in dfp.columns:
+        return out
+    for _, r in dfp.iterrows():
+        nom = str(r.get("Produit", "")).strip()
+        val = r.get(col)
+        if not nom or nom.lower() == "nan" or pd.isna(val):
+            continue
+        ht, ttc = paire_prix(val, taux, base)
+        out[nom] = {"ht": ht, "ttc": ttc}
+    return out
+
+
+def extraire_vrac(dfv: pd.DataFrame, taux: float, base: str) -> dict:
+    """Lit le tableau d'édition du vrac -> {palier: {'ht':…, 'ttc':…}}."""
+    out = {}
+    col = f"Prix {base} / T"
+    if dfv is None or dfv.empty or col not in dfv.columns:
+        return out
+    for _, r in dfv.iterrows():
+        palier, val = r.get("Palier (T)"), r.get(col)
+        if pd.isna(palier) or pd.isna(val):
+            continue
+        ht, ttc = paire_prix(val, taux, base)
+        out[int(palier)] = {"ht": ht, "ttc": ttc}
+    return out
+
+
+def extraire_zones(dfz: pd.DataFrame, taux: float, base: str) -> list:
+    """Lit le tableau d'édition des zones -> liste de zones complètes HT + TTC."""
+    out = []
+    c72, c15 = f"72 h {base}", f"15 j {base}"
+    if dfz is None or dfz.empty or c72 not in dfz.columns:
+        return out
+    for _, r in dfz.iterrows():
+        borne = r.get("Jusqu'à (km)")
+        if pd.isna(borne) or pd.isna(r.get(c72)) or pd.isna(r.get(c15)):
+            continue
+        h72, t72 = paire_prix(r[c72], taux, base)
+        h15, t15 = paire_prix(r[c15], taux, base)
+        out.append({"Zone": str(r.get("Zone", "")).strip() or "Zone",
+                    "Jusqu'à (km)": float(borne),
+                    "72 h HT": h72, "72 h TTC": t72,
+                    "15 j HT": h15, "15 j TTC": t15})
+    return out
+
+
 class RapportPDF:
     """Rapport PDF à la charte Hympyr (fpdf2 + police Unicode embarquée)."""
 
@@ -1896,25 +1946,45 @@ trois fichiers finissent par diverger.
              "validation. Aucun aller-retour de conversion, donc aucune dérive "
              "d'arrondi.")
     autre = "HT" if base == "TTC" else "TTC"
-    cle, cle_autre = base.lower(), autre.lower()
+    cle = base.lower()
+
+    st.caption(f"Saisissez uniquement la colonne **{base}**. La conversion "
+               f"{base} → {autre} s'affiche en direct sous chaque tableau et se "
+               "fige à la validation.")
 
     ca, cb = st.columns(2)
     with ca:
         st.markdown(f"**Palettes** — € {base} / palette")
         dfp = st.data_editor(
-            pd.DataFrame([{"Produit": k, f"Prix {base}": float(v[cle]),
-                           f"Prix {autre} (calculé)": float(v[cle_autre])}
+            pd.DataFrame([{"Produit": k, f"Prix {base}": float(v[cle])}
                           for k, v in st.session_state["palettes"].items()]),
             num_rows="dynamic", use_container_width=True, hide_index=True,
-            disabled=[f"Prix {autre} (calculé)"], key="ed_palettes")
+            column_config={f"Prix {base}": st.column_config.NumberColumn(
+                format="%.2f", min_value=0.0)},
+            key="ed_palettes")
+        apercu_pal = extraire_palettes(dfp, tva_m_saisi, base)
+        st.dataframe(
+            pd.DataFrame([{"Produit": k, "Prix HT": v["ht"],
+                           "TVA": taux_fmt(tva_m_saisi), "Prix TTC": v["ttc"]}
+                          for k, v in apercu_pal.items()]),
+            use_container_width=True, hide_index=True)
+
     with cb:
         st.markdown(f"**Vrac** — € {base} / tonne par palier")
         dfv = st.data_editor(
-            pd.DataFrame([{"Palier (T)": int(t), f"Prix {base} / T": float(v[cle]),
-                           f"Prix {autre} / T (calculé)": float(v[cle_autre])}
+            pd.DataFrame([{"Palier (T)": int(t), f"Prix {base} / T": float(v[cle])}
                           for t, v in sorted(st.session_state["vrac"].items())]),
             num_rows="dynamic", use_container_width=True, hide_index=True,
-            disabled=[f"Prix {autre} / T (calculé)"], key="ed_vrac")
+            column_config={f"Prix {base} / T": st.column_config.NumberColumn(
+                format="%.2f", min_value=0.0)},
+            key="ed_vrac")
+        apercu_vrac = extraire_vrac(dfv, tva_m_saisi, base)
+        st.dataframe(
+            pd.DataFrame([{"Palier": f"{t} T", "HT / T": v["ht"],
+                           "TVA": taux_fmt(tva_m_saisi), "TTC / T": v["ttc"],
+                           "Total TTC": round(t * v["ttc"], 2)}
+                          for t, v in sorted(apercu_vrac.items())]),
+            use_container_width=True, hide_index=True)
 
     st.markdown(f"**Frais de livraison palettes** — € {base}, bornes continues en km")
     dfz = st.data_editor(
@@ -1922,7 +1992,19 @@ trois fichiers finissent par diverger.
                        f"72 h {base}": float(z[f"72 h {base}"]),
                        f"15 j {base}": float(z[f"15 j {base}"])}
                       for z in st.session_state["zones"]]),
-        num_rows="dynamic", use_container_width=True, hide_index=True, key="ed_zones")
+        num_rows="dynamic", use_container_width=True, hide_index=True,
+        column_config={
+            "Jusqu'à (km)": st.column_config.NumberColumn(format="%.0f",
+                                                          min_value=0.0),
+            f"72 h {base}": st.column_config.NumberColumn(format="%.2f",
+                                                          min_value=0.0),
+            f"15 j {base}": st.column_config.NumberColumn(format="%.2f",
+                                                          min_value=0.0)},
+        key="ed_zones")
+    apercu_zones = extraire_zones(dfz, tva_l_saisi, base)
+    if apercu_zones:
+        st.dataframe(libelles_zones(apercu_zones, tva_l_saisi),
+                     use_container_width=True, hide_index=True)
 
     v1, v2 = st.columns(2)
     with v1:
@@ -1934,47 +2016,25 @@ trois fichiers finissent par diverger.
             f"Vrac — € {base} par km au-delà", 0.0, 20.0,
             float(st.session_state["prix_km_ttc"] if base == "TTC"
                   else st.session_state["prix_km_ht"]), 0.01, format="%.2f")
+    km_ht_apercu, km_ttc_apercu = paire_prix(prix_km_saisi, tva_l_saisi, base)
+    st.caption(f"→ Au-delà de {dec(franchise_saisie, 0)} km : "
+               f"**{eur(km_ht_apercu)} HT** / **{eur(km_ttc_apercu)} TTC** par km "
+               f"(TVA livraison {taux_fmt(tva_l_saisi)}).")
 
     if st.button("💾 Appliquer les modifications", type="primary"):
         try:
-            npal = {}
-            for _, r in dfp.iterrows():
-                nom = str(r["Produit"]).strip()
-                val = r[f"Prix {base}"]
-                if not nom or pd.isna(val):
-                    continue
-                ht, ttc = paire_prix(val, tva_m_saisi, base)
-                npal[nom] = {"ht": ht, "ttc": ttc}
-
-            nvrac = {}
-            for _, r in dfv.iterrows():
-                if pd.isna(r["Palier (T)"]) or pd.isna(r[f"Prix {base} / T"]):
-                    continue
-                ht, ttc = paire_prix(r[f"Prix {base} / T"], tva_m_saisi, base)
-                nvrac[int(r["Palier (T)"])] = {"ht": ht, "ttc": ttc}
-
-            nzones = []
-            for _, r in dfz.iterrows():
-                if pd.isna(r["Jusqu'à (km)"]) or pd.isna(r[f"72 h {base}"]) \
-                        or pd.isna(r[f"15 j {base}"]):
-                    continue
-                h72, t72 = paire_prix(r[f"72 h {base}"], tva_l_saisi, base)
-                h15, t15 = paire_prix(r[f"15 j {base}"], tva_l_saisi, base)
-                nzones.append({
-                    "Zone": str(r["Zone"]).strip() or "Zone",
-                    "Jusqu'à (km)": float(r["Jusqu'à (km)"]),
-                    "72 h HT": h72, "72 h TTC": t72,
-                    "15 j HT": h15, "15 j TTC": t15})
+            # Mêmes fonctions que l'aperçu : ce qui est affiché est ce qui est enregistré.
+            npal, nvrac, nzones = apercu_pal, apercu_vrac, apercu_zones
 
             if not npal or not nvrac or not nzones:
                 st.error("Chaque tableau doit contenir au moins une ligne valide.")
             else:
-                km_ht, km_ttc = paire_prix(prix_km_saisi, tva_l_saisi, base)
                 st.session_state.update({
                     "palettes": npal, "vrac": nvrac, "zones": nzones,
                     "tva_march": tva_m_saisi, "tva_livr": tva_l_saisi,
                     "base_saisie": base, "franchise_km": float(franchise_saisie),
-                    "prix_km_ht": km_ht, "prix_km_ttc": km_ttc})
+                    "prix_km_ht": km_ht_apercu, "prix_km_ttc": km_ttc_apercu,
+                    "source_grille": "Saisie manuelle dans l'application"})
                 st.success(f"Grille mise à jour (saisie en {base}, TVA marchandise "
                            f"{taux_fmt(tva_m_saisi)}, TVA livraison "
                            f"{taux_fmt(tva_l_saisi)}). Le simulateur utilise ces "
