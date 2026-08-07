@@ -1,235 +1,612 @@
+"""
+Hympyr Énergies — Simulateur granulés de bois
+Prix produit + frais de livraison + total TTC
+
+Calcul des frais basé sur la DISTANCE ROUTIÈRE RÉELLE (et non plus le code postal).
+
+Chaîne technique :
+  1. Géocodage CP + ville  -> API Adresse (BAN), service public gratuit, sans clé
+  2. Distance routière     -> OSRM public (gratuit, sans clé)
+  3. Repli automatique     -> distance orthodromique majorée, puis saisie manuelle
+
+Usage interne équipe commerciale.
+"""
+
+import math
+from datetime import datetime
+
+import requests
 import streamlit as st
 
-# ── Configuration ────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# CONFIGURATION MÉTIER  —  tout ce qui change se modifie ICI
+# ══════════════════════════════════════════════════════════════════════════════
+
+ADRESSE_DEPART = "490 route de Toulouse, 81370 Saint-Sulpice-la-Pointe"
+
+# Grille palettes : (borne supérieure incluse en km, libellé, prix 72h, prix 15j)
+# Bornes CONTINUES pour éviter tout trou de grille avec des distances décimales.
+ZONES_PALETTE = [
+    (10.0, "Zone 1", "≤ 10 km", 49.0, 29.0),
+    (20.0, "Zone 2", "> 10 à 20 km", 49.0, 35.0),
+    (30.0, "Zone 3", "> 20 à 30 km", 59.0, 45.0),
+    (53.0, "Zone 4", "> 30 à 53 km", 79.0, 59.0),
+    (float("inf"), "Zone 5", "> 53 km", 95.0, 69.0),
+]
+
+# Vrac : franchise de 35 km, puis tarif au km au-delà
+VRAC_FRANCHISE_KM = 35.0
+VRAC_PRIX_KM = 1.40  # € TTC par km au-delà de la franchise
+
+# Tarifs produits TTC
+PRIX_PALETTES = {
+    "Piveteau": 452.87,
+    "Granulés de nos régions": 431.24,
+}
+
+# Vrac : prix TTC à la tonne selon le tonnage commandé
+PRIX_VRAC_TONNE = {
+    2: 437.0,
+    3: 420.0,
+    4: 415.0,
+    5: 409.0,
+    6: 404.0,
+    7: 404.0,
+    8: 399.0,
+    9: 399.0,
+}
+
+# Seuil d'alerte : au-delà, la grille zone 5 est appliquée mais signalée
+SEUIL_ALERTE_KM = 80.0
+
+# Arrondi du kilométrage retenu pour la facturation : "entier" | "superieur" | "aucun"
+ARRONDI_KM = "entier"
+
+# Majoration appliquée à la distance à vol d'oiseau en cas de panne du routeur
+COEF_VOL_OISEAU = 1.30
+
+TELEPHONE = "05 61 70 03 27"
+
+# ══════════════════════════════════════════════════════════════════════════════
+# UTILITAIRES
+# ══════════════════════════════════════════════════════════════════════════════
+
 st.set_page_config(
-    page_title="Hympyr – Simulateur frais de livraison",
+    page_title="Hympyr – Simulateur granulés",
     page_icon="🌿",
     layout="centered",
 )
 
-# ── Données zones ─────────────────────────────────────────────────────────────
-RAW = {
-    1: ["31380","31660","81370","81800"],
-    2: ["31130","31140","31180","31240","31340","31380","31590","31620",
-        "81310","81500","81501","81502","81503","81506","81509","81600","81630"],
-    3: ["31130","31131","31132","31133","31134","31135","31136","31137","31138","31139",
-        "31140","31141","31142","31149","31150","31151","31152","31155","31159","31189",
-        "31460","31570","31620","31621","31629","31790","81140","81150","81220","81300",
-        "81301","81302","81303","81304","81305","81500","81600","81601","81602","81603",
-        "81604","81605","81609","81630","82230","82370"],
-    4: ["82000","81000","82800","82170","81700","31840","31900","31901","31902","31903","31931","31945",
-        "31947","31950","31957","31958","31960","31962","31998","31999","31650","31670",
-        "31671","31672","31673","31674","31675","31676","31677","31678","31679","31681",
-        "31682","31683","31685","31689","31692","31700","31701","31702","31703","31704",
-        "31705","31706","31707","31708","31709","31711","31712","31715","31716","31750",
-        "31780","31589","31489","31500","31503","31504","31505","31506","31507","31512",
-        "31520","31200","31201","31203","31204","31205","31240","31241","31242","31243",
-        "31244","31245","31249","31280","31289","31300","31312","31313","31314","31315",
-        "31317","31319","31330","31389","31401","31402","31403","31404","31405","31406",
-        "31432","31450","31000","31001","31002","31003","31004","31005","31006","31007",
-        "31008","31009","31010","31011","31012","31013","31014","31015","31016","31017",
-        "31018","31019","31020","31021","31022","31023","31024","31025","31026","31027",
-        "31028","31029","31030","31031","31032","31033","31034","31035","31036","31037",
-        "31038","31039","31040","31041","31042","31043","31044","31045","31046","31047",
-        "31048","31049","31050","31051","31052","31053","31054","31055","31056","31057",
-        "31058","31059","31060","31061","31062","31063","31064","31065","31066","31067",
-        "31068","31069","31070","31071","31072","31073","31074","31075","31076","31077",
-        "31078","31079","31080","31081","31082","31084","31085","31086","31088","31089",
-        "31090","31091","31092","31093","31094","31095","31096","31097","31098","31099",
-        "31101","31102","31103","31104","31106","31107","31109","31112","31170","31460",
-        "81440"],
-    5: ["31120","31121","31122","31123","31124","31125","31126","31127","31128","31129",
-        "31270","31290","31320","31321","31322","31325","31326","31329","31490","31540",
-        "31820","31830","31831","31832","31839","31860","31880","81170","81580","82140",
-        "82290","82700","31250","31410","31470","31480","31530","31550","31560","31600",
-        "31601","31602","31603","31604","31605","31606","31608","31609","31810","31870",
-        "32430","32600","81090","81100","81101","81102","81103","81104","81105","81106",
-        "81107","81108","81109","81110","81115","81116","81120","31131","81160","81190",
-        "81210","81290","81350","81360","81380","81400","81430","81450","81540","81640",
-        "81710","81990","82100","82130","82160","82220","82240","82250","82270","82300",
-        "82301","82302","82303","82330","82440","82500","82600"],
-}
 
-TARIFS = {
-    1: {"label": "≤ 10 km", "72h": 49, "15j": 29},
-    2: {"label": "11 – 20 km", "72h": 49, "15j": 35},
-    3: {"label": "21 – 30 km", "72h": 59, "15j": 45},
-    4: {"label": "31 – 53 km", "72h": 79, "15j": 59},
-    5: {"label": "54 – 60 km", "72h": 95, "15j": 69},
-}
+def eur(v: float) -> str:
+    """Formate un montant en euros, format français."""
+    s = f"{v:,.2f}".replace(",", "@").replace(".", ",").replace("@", "\u202f")
+    return f"{s} €"
 
-# Construire le dictionnaire CP → zone (priorité zone la plus proche)
-CP_ZONE: dict[str, int] = {}
-for zone in sorted(RAW.keys()):
-    for cp in RAW[zone]:
-        cp = cp.strip()
-        if cp and cp not in CP_ZONE:
-            CP_ZONE[cp] = zone
 
-# ── CSS Hympyr ────────────────────────────────────────────────────────────────
-st.markdown("""
+def km_fmt(v: float) -> str:
+    return f"{v:.1f}".replace(".", ",") + " km"
+
+
+def dec(v: float, n: int = 2) -> str:
+    """Formate un nombre décimal au format français, sans symbole."""
+    return f"{v:.{n}f}".replace(".", ",")
+
+
+def arrondir_km(km: float) -> float:
+    if ARRONDI_KM == "entier":
+        return float(round(km))
+    if ARRONDI_KM == "superieur":
+        return float(math.ceil(km))
+    return km
+
+
+def haversine(lat1, lon1, lat2, lon2) -> float:
+    """Distance orthodromique en km."""
+    r = 6371.0
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dp = math.radians(lat2 - lat1)
+    dl = math.radians(lon2 - lon1)
+    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * r * math.asin(math.sqrt(a))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# GÉOCODAGE ET ROUTAGE
+# ══════════════════════════════════════════════════════════════════════════════
+
+@st.cache_data(ttl=60 * 60 * 24 * 30, show_spinner=False)
+def geocoder_adresse(adresse: str):
+    """Géocode une adresse libre via l'API Adresse (BAN). -> (lat, lon, label) ou None."""
+    try:
+        r = requests.get(
+            "https://api-adresse.data.gouv.fr/search/",
+            params={"q": adresse, "limit": 1},
+            timeout=8,
+        )
+        r.raise_for_status()
+        feats = r.json().get("features", [])
+        if not feats:
+            return None
+        f = feats[0]
+        lon, lat = f["geometry"]["coordinates"]
+        return (lat, lon, f["properties"].get("label", adresse))
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=60 * 60 * 24 * 30, show_spinner=False)
+def chercher_communes(code_postal: str, ville: str = ""):
+    """
+    Retourne la liste des communes correspondant au CP (et éventuellement à la ville).
+    -> [{'label', 'ville', 'cp', 'lat', 'lon'}, ...]
+    """
+    params = {"limit": 15, "type": "municipality"}
+    if ville.strip():
+        params["q"] = ville.strip()
+        params["postcode"] = code_postal
+    else:
+        params["q"] = code_postal
+        params["postcode"] = code_postal
+
+    try:
+        r = requests.get(
+            "https://api-adresse.data.gouv.fr/search/", params=params, timeout=8
+        )
+        r.raise_for_status()
+        out = []
+        for f in r.json().get("features", []):
+            p = f["properties"]
+            lon, lat = f["geometry"]["coordinates"]
+            out.append(
+                {
+                    "label": p.get("label", ""),
+                    "ville": p.get("city") or p.get("name", ""),
+                    "cp": p.get("postcode", ""),
+                    "lat": lat,
+                    "lon": lon,
+                }
+            )
+        return out
+    except Exception:
+        return []
+
+
+@st.cache_data(ttl=60 * 60 * 24 * 30, show_spinner=False)
+def distance_routiere(lat1, lon1, lat2, lon2):
+    """
+    Distance routière réelle via OSRM.
+    -> (km, minutes, source) ; source = 'osrm' | 'estimation'
+    """
+    try:
+        url = (
+            f"https://router.project-osrm.org/route/v1/driving/"
+            f"{lon1},{lat1};{lon2},{lat2}"
+        )
+        r = requests.get(
+            url, params={"overview": "false", "alternatives": "false"}, timeout=10
+        )
+        r.raise_for_status()
+        data = r.json()
+        if data.get("code") == "Ok" and data.get("routes"):
+            route = data["routes"][0]
+            return (
+                route["distance"] / 1000.0,
+                route["duration"] / 60.0,
+                "osrm",
+            )
+    except Exception:
+        pass
+
+    # Repli : orthodromique majorée (vitesse moyenne conventionnelle 55 km/h)
+    km = haversine(lat1, lon1, lat2, lon2) * COEF_VOL_OISEAU
+    return (km, km / 55.0 * 60.0, "estimation")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CALCULS TARIFAIRES
+# ══════════════════════════════════════════════════════════════════════════════
+
+def zone_palette(km: float):
+    """-> (nom_zone, libelle, prix_72h, prix_15j)"""
+    for borne, nom, libelle, p72, p15 in ZONES_PALETTE:
+        if km <= borne:
+            return nom, libelle, p72, p15
+    return ZONES_PALETTE[-1][1:]
+
+
+def frais_vrac(km: float) -> float:
+    """1,40 € TTC par km au-delà de 35 km. 0 € en deçà."""
+    excedent = max(0.0, km - VRAC_FRANCHISE_KM)
+    return round(excedent * VRAC_PRIX_KM, 2)
+
+
+def prix_vrac_tonne(tonnage: int) -> float:
+    return PRIX_VRAC_TONNE[tonnage]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STYLE
+# ══════════════════════════════════════════════════════════════════════════════
+
+st.markdown(
+    """
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Poppins:wght@400;600;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600;700&display=swap');
 
 html, body, [class*="css"] { font-family: 'Poppins', sans-serif; }
 
-/* Header */
 .hympyr-header {
     background: linear-gradient(135deg, #005727 0%, #14B02F 100%);
     border-radius: 16px;
-    padding: 28px 32px;
-    margin-bottom: 32px;
+    padding: 26px 30px;
+    margin-bottom: 26px;
     color: white;
 }
-.hympyr-header h1 { font-size: 1.6rem; font-weight: 700; margin: 0; }
-.hympyr-header p  { margin: 6px 0 0; opacity: .85; font-size: .9rem; }
+.hympyr-header h1 { font-size: 1.55rem; font-weight: 700; margin: 0; }
+.hympyr-header p  { margin: 6px 0 0; opacity: .85; font-size: .88rem; }
 
-/* Résultat carte */
 .result-card {
     border-radius: 14px;
-    padding: 24px 28px;
-    margin: 20px 0;
+    padding: 22px 26px;
+    margin: 18px 0;
     border-left: 6px solid;
+    background: #f0faf3;
+    border-color: #14B02F;
 }
-.zone-ok  { background: #f0faf3; border-color: #14B02F; }
-.zone-err { background: #fff4f4; border-color: #e53935; }
+.card-warn { background: #fffaf0; border-color: #f0a202; }
+.card-err  { background: #fff4f4; border-color: #e53935; }
 
 .zone-badge {
     display: inline-block;
-    background: #14B02F;
-    color: white;
-    font-size: 1rem;
-    font-weight: 700;
-    padding: 4px 14px;
-    border-radius: 20px;
-    margin-bottom: 12px;
+    background: #14B02F; color: white;
+    font-size: .95rem; font-weight: 700;
+    padding: 4px 14px; border-radius: 20px;
+    margin-bottom: 10px;
 }
-.tarif-grid {
-    display: flex;
-    gap: 16px;
-    margin-top: 14px;
-    flex-wrap: wrap;
-}
-.tarif-box {
-    flex: 1;
-    min-width: 140px;
-    background: white;
-    border-radius: 10px;
-    padding: 14px 18px;
-    box-shadow: 0 2px 8px rgba(0,87,39,.10);
+
+.total-box {
+    background: linear-gradient(135deg, #005727 0%, #14B02F 100%);
+    color: white; border-radius: 14px;
+    padding: 22px 26px; margin: 18px 0;
     text-align: center;
 }
-.tarif-box .label { font-size: .78rem; color: #666; margin-bottom: 4px; }
-.tarif-box .price { font-size: 1.7rem; font-weight: 700; color: #005727; }
-.tarif-box .sublabel { font-size: .75rem; color: #888; }
+.total-box .lbl { font-size: .82rem; opacity: .85; letter-spacing: 1px; text-transform: uppercase; }
+.total-box .val { font-size: 2.4rem; font-weight: 700; line-height: 1.2; }
+.total-box .sub { font-size: .8rem; opacity: .8; }
 
-/* Grille complète */
+.ligne {
+    display: flex; justify-content: space-between;
+    padding: 9px 0; border-bottom: 1px dashed #d7ece0;
+    font-size: .95rem;
+}
+.ligne:last-child { border-bottom: none; }
+.ligne .k { color: #444; }
+.ligne .v { font-weight: 600; color: #005727; }
+
 .grid-table { width: 100%; border-collapse: collapse; margin-top: 8px; font-size: .88rem; }
 .grid-table th { background: #005727; color: white; padding: 8px 12px; text-align: left; }
 .grid-table td { padding: 8px 12px; border-bottom: 1px solid #e8f5e9; }
 .grid-table tr:last-child td { border: none; }
-.grid-table tr:hover td { background: #f0faf3; }
-.z-badge {
-    background: #e8f5e9; color: #005727; font-weight: 700;
-    padding: 2px 10px; border-radius: 12px; font-size: .82rem;
-}
-
-/* Input */
-div[data-testid="stTextInput"] input {
-    font-size: 1.2rem !important;
-    font-family: 'Poppins', sans-serif !important;
-    border-radius: 10px !important;
-    border: 2px solid #c8e6c9 !important;
-    padding: 12px 16px !important;
-    letter-spacing: 3px;
-}
-div[data-testid="stTextInput"] input:focus {
-    border-color: #14B02F !important;
-    box-shadow: 0 0 0 3px rgba(20,176,47,.15) !important;
-}
+.z-badge { background: #e8f5e9; color: #005727; font-weight: 700;
+           padding: 2px 10px; border-radius: 12px; font-size: .82rem; }
 </style>
-""", unsafe_allow_html=True)
-
-# ── En-tête ───────────────────────────────────────────────────────────────────
-st.markdown("""
-<div class="hympyr-header">
-    <h1>🌿 Simulateur frais de livraison</h1>
-    <p>Granulés de bois · Départ Saint-Sulpice (81370)</p>
-</div>
-""", unsafe_allow_html=True)
-
-# ── Input ─────────────────────────────────────────────────────────────────────
-cp_input = st.text_input(
-    "Code postal du client",
-    placeholder="ex : 81100",
-    max_chars=5,
-    label_visibility="visible",
+""",
+    unsafe_allow_html=True,
 )
 
-# ── Résultat ──────────────────────────────────────────────────────────────────
-if cp_input:
-    cp = cp_input.strip().zfill(5)
-    if not cp.isdigit() or len(cp) != 5:
-        st.markdown('<div class="result-card zone-err">⚠️ Code postal invalide.</div>', unsafe_allow_html=True)
-    elif cp in CP_ZONE:
-        z = CP_ZONE[cp]
-        t = TARIFS[z]
-        st.markdown(f"""
-        <div class="result-card zone-ok">
-            <div class="zone-badge">Zone {z} — {t['label']} de Saint-Sulpice</div>
-            <div style="color:#333; font-size:.9rem; margin-bottom:4px;">Code postal : <strong>{cp}</strong></div>
-            <div class="tarif-grid">
-                <div class="tarif-box">
-                    <div class="label">⚡ Livraison sous 72H</div>
-                    <div class="price">{t['72h']} €</div>
-                    <div class="sublabel">prioritaire</div>
-                </div>
-                <div class="tarif-box">
-                    <div class="label">📅 Livraison sous 15 jours</div>
-                    <div class="price">{t['15j']} €</div>
-                    <div class="sublabel">tournée optimisée</div>
-                </div>
-            </div>
-            <div style="margin-top:14px; font-size:.78rem; color:#666;">
-                ℹ️ À partir de 2 palettes, les frais de livraison sont facturés une seule fois.
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
-    else:
-        st.markdown(f"""
-        <div class="result-card zone-err">
-            <strong>❌ Code postal {cp} non référencé</strong><br>
-            <span style="font-size:.88rem; color:#666; margin-top:6px; display:block;">
-            Ce code postal ne fait pas partie des zones de livraison actuellement configurées.<br>
-            Contactez-nous au 05 61 70 03 27 et nous étudierons votre demande dans les 24 heures.
-            </span>
-        </div>
-        """, unsafe_allow_html=True)
-
-# ── Grille tarifaire complète ─────────────────────────────────────────────────
-st.markdown("---")
-with st.expander("📋 Voir la grille tarifaire complète"):
-    st.markdown("""
-    <table class="grid-table">
-        <tr>
-            <th>Zone</th>
-            <th>Rayon</th>
-            <th>Sous 72H</th>
-            <th>Sous 15 jours</th>
-        </tr>
-        <tr><td><span class="z-badge">Zone 1</span></td><td>≤ 10 km</td><td><strong>49 €</strong></td><td><strong>29 €</strong></td></tr>
-        <tr><td><span class="z-badge">Zone 2</span></td><td>11 – 20 km</td><td><strong>49 €</strong></td><td><strong>35 €</strong></td></tr>
-        <tr><td><span class="z-badge">Zone 3</span></td><td>21 – 30 km</td><td><strong>59 €</strong></td><td><strong>45 €</strong></td></tr>
-        <tr><td><span class="z-badge">Zone 4</span></td><td>31 – 53 km</td><td><strong>79 €</strong></td><td><strong>59 €</strong></td></tr>
-        <tr><td><span class="z-badge">Zone 5</span></td><td>54 – 60 km</td><td><strong>95 €</strong></td><td><strong>69 €</strong></td></tr>
-    </table>
-    <div style="font-size:.78rem; color:#888; margin-top:10px;">
-    À partir de 2 palettes, les frais sont facturés une seule fois.
-    </div>
-    """, unsafe_allow_html=True)
-
-st.markdown("""
-<div style="text-align:center; color:#aaa; font-size:.75rem; margin-top:40px;">
-Hympyr Energies · Usage interne équipe granulés
+st.markdown(
+    """
+<div class="hympyr-header">
+    <h1>🌿 Simulateur granulés — prix &amp; livraison</h1>
+    <p>Départ : 490 route de Toulouse, 81370 Saint-Sulpice-la-Pointe · Distance routière réelle</p>
 </div>
-""", unsafe_allow_html=True)
+""",
+    unsafe_allow_html=True,
+)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PARAMÈTRES (barre latérale)
+# ══════════════════════════════════════════════════════════════════════════════
+
+with st.sidebar:
+    st.markdown("### ⚙️ Paramètres")
+    adresse_depart = st.text_input("Adresse de départ", value=ADRESSE_DEPART)
+    aller_retour = st.checkbox(
+        "Compter l'aller-retour",
+        value=False,
+        help="Décoché : seul le trajet dépôt → client est facturé.",
+    )
+    st.divider()
+    forcer_km = st.checkbox("Forcer le kilométrage manuellement", value=False)
+    km_manuel = st.number_input(
+        "Distance retenue (km)",
+        min_value=0.0, max_value=500.0, value=0.0, step=1.0,
+        disabled=not forcer_km,
+    )
+    st.divider()
+    st.caption(
+        "Distances calculées via l'API Adresse (data.gouv.fr) et OSRM. "
+        "En cas d'indisponibilité, une estimation majorée est proposée : "
+        "vérifier avant engagement client."
+    )
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ÉTAPE 1 — DESTINATION
+# ══════════════════════════════════════════════════════════════════════════════
+
+st.markdown("#### 📍 1. Adresse de livraison")
+
+c1, c2 = st.columns([1, 2])
+with c1:
+    cp = st.text_input("Code postal", placeholder="81100", max_chars=5)
+with c2:
+    ville = st.text_input("Ville (recommandé)", placeholder="Castres")
+
+destination = None
+km_reel = None
+minutes = None
+source = None
+
+if cp and cp.strip().isdigit() and len(cp.strip()) == 5:
+    communes = chercher_communes(cp.strip(), ville)
+
+    if not communes:
+        st.markdown(
+            f"""<div class="result-card card-err">
+            <strong>❌ Adresse introuvable</strong><br>
+            <span style="font-size:.88rem;color:#666;">
+            Aucune commune ne correspond au code postal {cp}
+            {"et à la ville « " + ville + " »" if ville else ""}.
+            Vérifiez la saisie, ou forcez le kilométrage dans le menu latéral.
+            </span></div>""",
+            unsafe_allow_html=True,
+        )
+    else:
+        if len(communes) == 1:
+            destination = communes[0]
+            st.success(f"Destination : {destination['label']}")
+        else:
+            idx = st.selectbox(
+                "Plusieurs communes correspondent — sélectionnez la bonne :",
+                range(len(communes)),
+                format_func=lambda i: communes[i]["label"],
+            )
+            destination = communes[idx]
+
+# Calcul de la distance
+if destination is not None:
+    depart = geocoder_adresse(adresse_depart)
+    if depart is None:
+        st.error(
+            "Impossible de géocoder l'adresse de départ. "
+            "Vérifiez la connexion ou forcez le kilométrage manuellement."
+        )
+    else:
+        with st.spinner("Calcul de l'itinéraire…"):
+            km_reel, minutes, source = distance_routiere(
+                depart[0], depart[1], destination["lat"], destination["lon"]
+            )
+
+# Kilométrage retenu
+km_retenu = None
+if forcer_km and km_manuel > 0:
+    km_retenu = km_manuel
+    source = "manuel"
+elif km_reel is not None:
+    km_retenu = km_reel * (2 if aller_retour else 1)
+
+if km_retenu is not None:
+    km_retenu = arrondir_km(km_retenu)
+
+    libelle_source = {
+        "osrm": "🛣️ Itinéraire routier réel",
+        "estimation": "⚠️ Estimation (routeur indisponible) — à vérifier",
+        "manuel": "✏️ Kilométrage saisi manuellement",
+    }[source]
+
+    trajet = "aller-retour" if aller_retour and source != "manuel" else "aller simple"
+    duree = f" · ~{minutes:.0f} min" if minutes and source == "osrm" else ""
+
+    st.markdown(
+        f"""<div class="result-card {'card-warn' if source == 'estimation' else ''}">
+        <div class="zone-badge">{km_fmt(km_retenu)} — {trajet}</div>
+        <div style="font-size:.85rem;color:#555;">{libelle_source}{duree}</div>
+        </div>""",
+        unsafe_allow_html=True,
+    )
+
+    if km_retenu > SEUIL_ALERTE_KM:
+        st.warning(
+            f"Distance supérieure à {SEUIL_ALERTE_KM:.0f} km : "
+            "la grille zone 5 s'applique, mais faites valider la faisabilité "
+            "et la marge par l'exploitation avant engagement."
+        )
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ÉTAPE 2 — COMMANDE
+# ══════════════════════════════════════════════════════════════════════════════
+
+st.markdown("#### 📦 2. Commande")
+
+mode = st.radio(
+    "Conditionnement",
+    ["Palettes", "Vrac"],
+    horizontal=True,
+    label_visibility="collapsed",
+)
+
+prix_produit = 0.0
+lignes = []
+frais = None
+detail_frais = ""
+
+if mode == "Palettes":
+    ca, cb = st.columns(2)
+    with ca:
+        nb_piveteau = st.number_input("Palettes Piveteau", 0, 20, 0, 1)
+    with cb:
+        nb_regions = st.number_input("Palettes Granulés de nos régions", 0, 20, 0, 1)
+
+    delai = st.radio(
+        "Délai de livraison",
+        ["Sous 72 h (prioritaire)", "Sous 15 jours (tournée optimisée)"],
+        horizontal=False,
+    )
+
+    nb_total = nb_piveteau + nb_regions
+
+    if nb_piveteau:
+        montant = nb_piveteau * PRIX_PALETTES["Piveteau"]
+        prix_produit += montant
+        lignes.append((f"{nb_piveteau} × Palette Piveteau", montant))
+    if nb_regions:
+        montant = nb_regions * PRIX_PALETTES["Granulés de nos régions"]
+        prix_produit += montant
+        lignes.append((f"{nb_regions} × Palette Granulés de nos régions", montant))
+
+    if km_retenu is not None and nb_total > 0:
+        nom_z, lib_z, p72, p15 = zone_palette(km_retenu)
+        frais = p72 if delai.startswith("Sous 72") else p15
+        detail_frais = (
+            f"{nom_z} ({lib_z}) · "
+            f"{'sous 72 h' if delai.startswith('Sous 72') else 'sous 15 jours'}"
+            + (" · facturés une seule fois" if nb_total > 1 else "")
+        )
+
+else:  # Vrac
+    tonnage = st.select_slider(
+        "Tonnage commandé",
+        options=list(PRIX_VRAC_TONNE.keys()),
+        value=4,
+        format_func=lambda t: f"{t} T",
+    )
+    pt = prix_vrac_tonne(tonnage)
+    prix_produit = tonnage * pt
+    lignes.append((f"{tonnage} T vrac × {eur(pt)}/T", prix_produit))
+
+    if km_retenu is not None:
+        frais = frais_vrac(km_retenu)
+        excedent = max(0.0, km_retenu - VRAC_FRANCHISE_KM)
+        if excedent == 0:
+            detail_frais = f"Dans la franchise de {VRAC_FRANCHISE_KM:.0f} km — offerts"
+        else:
+            detail_frais = (
+                f"{km_fmt(excedent)} au-delà de {VRAC_FRANCHISE_KM:.0f} km "
+                f"× {dec(VRAC_PRIX_KM)} € TTC/km"
+            )
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ÉTAPE 3 — RÉSULTAT
+# ══════════════════════════════════════════════════════════════════════════════
+
+if prix_produit > 0:
+    st.markdown("#### 🧮 3. Devis")
+
+    html_lignes = "".join(
+        f'<div class="ligne"><span class="k">{k}</span>'
+        f'<span class="v">{eur(v)}</span></div>'
+        for k, v in lignes
+    )
+
+    if frais is not None:
+        html_lignes += (
+            f'<div class="ligne"><span class="k">Frais de livraison<br>'
+            f'<span style="font-size:.78rem;color:#888;">{detail_frais}</span></span>'
+            f'<span class="v">{eur(frais)}</span></div>'
+        )
+
+    st.markdown(f'<div class="result-card">{html_lignes}</div>', unsafe_allow_html=True)
+
+    if frais is None:
+        st.info(
+            "Saisissez le code postal (et la ville) pour obtenir les frais de "
+            "livraison et le total."
+        )
+    else:
+        total = prix_produit + frais
+        st.markdown(
+            f"""<div class="total-box">
+            <div class="lbl">Total TTC</div>
+            <div class="val">{eur(total)}</div>
+            <div class="sub">dont {eur(prix_produit)} de marchandise
+            et {eur(frais)} de livraison</div>
+            </div>""",
+            unsafe_allow_html=True,
+        )
+
+        # Récapitulatif copiable (mail / téléphone)
+        dest_txt = destination["label"] if destination else f"{cp} {ville}".strip()
+        recap = [
+            f"Devis granulés — {datetime.now():%d/%m/%Y}",
+            f"Livraison : {dest_txt}",
+            f"Distance : {km_fmt(km_retenu)} ({'aller-retour' if aller_retour else 'aller simple'})",
+            "",
+        ]
+        recap += [f"- {k} : {eur(v)}" for k, v in lignes]
+        recap += [
+            f"- Frais de livraison ({detail_frais}) : {eur(frais)}",
+            "",
+            f"TOTAL TTC : {eur(total)}",
+        ]
+        with st.expander("📋 Récapitulatif à copier (mail / téléphone)"):
+            st.code("\n".join(recap), language=None)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# GRILLES DE RÉFÉRENCE
+# ══════════════════════════════════════════════════════════════════════════════
+
+st.markdown("---")
+
+with st.expander("📋 Grilles tarifaires de référence"):
+    lignes_zones = "".join(
+        f"<tr><td><span class='z-badge'>{nom}</span></td><td>{lib}</td>"
+        f"<td><strong>{eur(p72)}</strong></td><td><strong>{eur(p15)}</strong></td></tr>"
+        for _, nom, lib, p72, p15 in ZONES_PALETTE
+    )
+    lignes_vrac = "".join(
+        f"<tr><td>{t} T</td><td><strong>{eur(p)}</strong> / tonne</td>"
+        f"<td>{eur(t * p)}</td></tr>"
+        for t, p in PRIX_VRAC_TONNE.items()
+    )
+    st.markdown(
+        f"""
+<strong style="color:#005727;">Livraison palettes</strong>
+<table class="grid-table">
+<tr><th>Zone</th><th>Distance routière</th><th>Sous 72 h</th><th>Sous 15 j</th></tr>
+{lignes_zones}
+</table>
+<div style="font-size:.78rem;color:#888;margin:8px 0 18px;">
+À partir de 2 palettes, les frais sont facturés une seule fois.
+</div>
+
+<strong style="color:#005727;">Livraison vrac</strong>
+<div style="font-size:.88rem;margin:6px 0 18px;">
+Gratuite jusqu'à {VRAC_FRANCHISE_KM:.0f} km, puis
+{dec(VRAC_PRIX_KM)} € TTC par km au-delà.
+</div>
+
+<strong style="color:#005727;">Tarifs produits TTC</strong>
+<table class="grid-table">
+<tr><th>Palette</th><th>Prix TTC</th><th></th></tr>
+<tr><td>Piveteau</td><td><strong>{eur(PRIX_PALETTES['Piveteau'])}</strong></td><td></td></tr>
+<tr><td>Granulés de nos régions</td>
+<td><strong>{eur(PRIX_PALETTES['Granulés de nos régions'])}</strong></td><td></td></tr>
+</table>
+<table class="grid-table" style="margin-top:14px;">
+<tr><th>Vrac</th><th>Prix / tonne</th><th>Total marchandise</th></tr>
+{lignes_vrac}
+</table>
+""",
+        unsafe_allow_html=True,
+    )
+
+st.markdown(
+    f"""
+<div style="text-align:center;color:#aaa;font-size:.75rem;margin-top:36px;">
+Hympyr Énergies · Usage interne équipe granulés · {TELEPHONE}<br>
+Simulation indicative — ne vaut pas engagement contractuel.
+</div>
+""",
+    unsafe_allow_html=True,
+)
