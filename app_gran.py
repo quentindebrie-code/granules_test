@@ -839,6 +839,235 @@ def export_excel(date_grille, palettes: dict, vrac: dict, zones: list,
     return buf.getvalue()
 
 
+FICHIER_GRILLE_VERSIONNEE = "grille_courante.xlsx"
+
+
+def borne_depuis_libelle(valeur):
+    """
+    Reconstitue la borne supérieure d'une zone depuis sa valeur d'export.
+    Accepte un nombre brut (20) ou le libellé lisible produit par l'outil :
+      '≤ 10 km' -> 10.0   '> 10 à 20 km' -> 20.0   '> 53 km' -> 9999.0
+    Renvoie None si la valeur n'est pas une borne de zone.
+    """
+    if valeur is None or (isinstance(valeur, float) and math.isnan(valeur)):
+        return None
+    if isinstance(valeur, (int, float, np.integer, np.floating)):
+        return float(valeur)
+
+    txt = str(valeur).strip()
+    nombres = re.findall(r"\d+(?:[.,]\d+)?", txt)
+    if not nombres:
+        return None
+    # « > 53 km » sans borne haute : zone ouverte
+    if txt.lstrip().startswith(">") and len(nombres) == 1:
+        return 9999.0
+    return float(nombres[-1].replace(",", "."))
+
+
+def lire_grille_classeur(source, taux_defaut_march: float = TVA_MARCHANDISE_DEFAUT,
+                         taux_defaut_livr: float = TVA_LIVRAISON_DEFAUT):
+    """
+    Relit un classeur produit par export_excel() et reconstitue la grille.
+    Le fichier exporté est le fichier rechargé : aucun format supplémentaire.
+
+    -> (dict_grille | None, liste_de_messages)
+    Le dict contient : date_grille, palettes, vrac, zones, tva_march, tva_livr,
+    franchise_km, prix_km_ht, prix_km_ttc.
+    """
+    msgs = []
+    try:
+        classeur = pd.ExcelFile(source)
+    except Exception as e:
+        return None, [f"Fichier illisible ({e})."]
+
+    if "Grille tarifaire" not in classeur.sheet_names:
+        return None, ["Onglet « Grille tarifaire » introuvable. Utilisez un "
+                      "classeur exporté par cet outil."]
+
+    try:
+        g = classeur.parse("Grille tarifaire")
+    except Exception as e:
+        return None, [f"Onglet « Grille tarifaire » illisible ({e})."]
+
+    cols = {normaliser(c): c for c in g.columns}
+    besoin = [c for c in ("produit", "prix_ht", "prix_ttc") if c not in cols]
+    if besoin:
+        return None, [f"Colonnes manquantes dans « Grille tarifaire » : "
+                      f"{', '.join(besoin)}."]
+
+    g["_ht"] = _num_fr(g[cols["prix_ht"]])
+    g["_ttc"] = _num_fr(g[cols["prix_ttc"]])
+    g["_cond"] = (g[cols["conditionnement"]].astype(str).str.strip().str.lower()
+                  if "conditionnement" in cols else "")
+    g["_palier"] = (pd.to_numeric(g[cols["palier_t"]], errors="coerce")
+                    if "palier_t" in cols else np.nan)
+
+    # Taux de TVA marchandise : relu de la colonne TVA, sinon déduit HT/TTC
+    tva_m = np.nan
+    if "tva" in cols:
+        taux = g[cols["tva"]].apply(normaliser_taux).dropna()
+        if not taux.empty:
+            tva_m = float(taux.mode().iloc[0])
+    if math.isnan(tva_m):
+        valides = g[(g["_ht"] > 0) & (g["_ttc"] > 0)]
+        if not valides.empty:
+            tva_m = round(float((valides["_ttc"] / valides["_ht"] - 1).median()), 4)
+            msgs.append(f"Colonne TVA absente : taux marchandise déduit du rapport "
+                        f"HT/TTC ({taux_fmt(tva_m)}).")
+    if math.isnan(tva_m):
+        tva_m = float(taux_defaut_march)
+        msgs.append(f"Taux de TVA marchandise introuvable, "
+                    f"{taux_fmt(tva_m)} appliqué par défaut.")
+
+    palettes, vrac = {}, {}
+    for _, r in g.iterrows():
+        ht, ttc = r["_ht"], r["_ttc"]
+        if pd.isna(ht) and pd.isna(ttc):
+            continue
+        if pd.isna(ht):
+            ht = ttc_vers_ht(ttc, tva_m)
+        if pd.isna(ttc):
+            ttc = ht_vers_ttc(ht, tva_m)
+        if str(r["_cond"]).startswith("vrac") and pd.notna(r["_palier"]):
+            vrac[int(r["_palier"])] = {"ht": round(float(ht), 2),
+                                       "ttc": round(float(ttc), 2)}
+        else:
+            nom = str(r[cols["produit"]]).strip()
+            if nom and nom.lower() != "nan":
+                palettes[nom] = {"ht": round(float(ht), 2),
+                                 "ttc": round(float(ttc), 2)}
+
+    if not palettes and not vrac:
+        return None, ["Aucune ligne de prix exploitable dans « Grille tarifaire »."]
+
+    # Date d'effet
+    date_grille = date.today()
+    if "date_d_effet" in cols or "date_effet" in cols or "date" in cols:
+        cle = cols.get("date_d_effet") or cols.get("date_effet") or cols.get("date")
+        d = pd.to_datetime(g[cle], errors="coerce", dayfirst=True).dropna()
+        if not d.empty:
+            date_grille = d.max().date()
+
+    # Onglet Livraison : zones + règles vrac
+    zones, tva_l = [], float(taux_defaut_livr)
+    franchise, km_ht, km_ttc = (VRAC_FRANCHISE_KM_DEFAUT, np.nan,
+                                VRAC_PRIX_KM_TTC_DEFAUT)
+    if "Livraison" in classeur.sheet_names:
+        try:
+            liv = classeur.parse("Livraison")
+            lc = {normaliser(c): c for c in liv.columns}
+            cle_borne = ("jusqu_a_km" if "jusqu_a_km" in lc
+                         else ("distance" if "distance" in lc else None))
+            if "zone" in lc and cle_borne:
+                for _, r in liv.iterrows():
+                    if pd.isna(r[lc["zone"]]) or pd.isna(r[lc[cle_borne]]):
+                        continue
+                    borne = borne_depuis_libelle(r[lc[cle_borne]])
+                    if borne is None:
+                        continue  # ligne « Règle vrac », pas une zone
+
+                    def _v(k):
+                        return (float(_num_fr(pd.Series([r[lc[k]]])).iloc[0])
+                                if k in lc and pd.notna(r[lc[k]]) else np.nan)
+
+                    zones.append({
+                        "Zone": str(r[lc["zone"]]).strip(), "Jusqu'à (km)": borne,
+                        "72 h HT": _v("72_h_ht"), "72 h TTC": _v("72_h_ttc"),
+                        "15 j HT": _v("15_j_ht"), "15 j TTC": _v("15_j_ttc")})
+                if "tva" in lc:
+                    t = liv[lc["tva"]].apply(normaliser_taux).dropna()
+                    if not t.empty:
+                        tva_l = float(t.mode().iloc[0])
+
+            # Bloc « Règle vrac » situé sous le tableau des zones
+            brut = classeur.parse("Livraison", header=None)
+            for _, r in brut.iterrows():
+                libelle = normaliser(r.iloc[0]) if pd.notna(r.iloc[0]) else ""
+                val = r.iloc[1] if len(r) > 1 else None
+                if val is None or pd.isna(val):
+                    continue
+                if "franchise" in libelle:
+                    franchise = float(_num_fr(pd.Series([val])).iloc[0])
+                elif "ht_km" in libelle or ("ht" in libelle and "km" in libelle):
+                    km_ht = float(_num_fr(pd.Series([val])).iloc[0])
+                elif "ttc_km" in libelle or ("ttc" in libelle and "km" in libelle):
+                    km_ttc = float(_num_fr(pd.Series([val])).iloc[0])
+                elif "tva_livraison" in libelle:
+                    t = normaliser_taux(val)
+                    if not math.isnan(t):
+                        tva_l = t
+        except Exception as e:
+            msgs.append(f"Onglet « Livraison » ignoré ({e}). Grille de livraison "
+                        "laissée inchangée.")
+            zones = []
+
+    # Complétion des montants de livraison manquants
+    zones_ok = []
+    for z in zones:
+        h72, t72 = z["72 h HT"], z["72 h TTC"]
+        h15, t15 = z["15 j HT"], z["15 j TTC"]
+        if math.isnan(h72) and math.isnan(t72):
+            continue
+        if math.isnan(h72):
+            h72 = ttc_vers_ht(t72, tva_l)
+        if math.isnan(t72):
+            t72 = ht_vers_ttc(h72, tva_l)
+        if math.isnan(h15) and math.isnan(t15):
+            h15, t15 = h72, t72
+        if math.isnan(h15):
+            h15 = ttc_vers_ht(t15, tva_l)
+        if math.isnan(t15):
+            t15 = ht_vers_ttc(h15, tva_l)
+        zones_ok.append({"Zone": z["Zone"], "Jusqu'à (km)": z["Jusqu'à (km)"],
+                         "72 h HT": h72, "72 h TTC": t72,
+                         "15 j HT": h15, "15 j TTC": t15})
+
+    if not zones_ok:
+        msgs.append("Grille de livraison non trouvée dans le classeur : "
+                    "les zones par défaut sont conservées.")
+        zones_ok = [{"Zone": z["Zone"], "Jusqu'à (km)": z["Jusqu'à (km)"],
+                     "72 h HT": ttc_vers_ht(z["72 h TTC"], tva_l),
+                     "72 h TTC": z["72 h TTC"],
+                     "15 j HT": ttc_vers_ht(z["15 j TTC"], tva_l),
+                     "15 j TTC": z["15 j TTC"]} for z in ZONES_TTC_DEFAUT]
+
+    if math.isnan(km_ht):
+        km_ht = ttc_vers_ht(km_ttc, tva_l)
+
+    if not palettes:
+        msgs.append("Aucune palette dans le classeur : la liste palettes est vide.")
+    if not vrac:
+        msgs.append("Aucun palier vrac dans le classeur : la liste vrac est vide.")
+
+    return ({"date_grille": date_grille, "palettes": palettes, "vrac": vrac,
+             "zones": zones_ok, "tva_march": tva_m, "tva_livr": tva_l,
+             "franchise_km": franchise, "prix_km_ht": km_ht,
+             "prix_km_ttc": km_ttc}, msgs)
+
+
+def lire_historique_classeur(source,
+                             taux_defaut: float = TVA_MARCHANDISE_DEFAUT):
+    """
+    Relit l'onglet « Données brutes » d'un classeur exporté.
+    -> (df, messages)
+    """
+    try:
+        classeur = pd.ExcelFile(source)
+    except Exception as e:
+        return df_vide(), [f"Fichier illisible ({e})."]
+
+    if "Données brutes" not in classeur.sheet_names:
+        return df_vide(), ["Onglet « Données brutes » absent : aucun historique "
+                           "à charger depuis ce classeur."]
+    try:
+        brut = classeur.parse("Données brutes")
+    except Exception as e:
+        return df_vide(), [f"Onglet « Données brutes » illisible ({e})."]
+
+    ok, rejets, avert = valider_import(brut, "Données brutes", taux_defaut)
+    return ok, rejets + avert
+
+
 class RapportPDF:
     """Rapport PDF à la charte Hympyr (fpdf2 + police Unicode embarquée)."""
 
@@ -1210,9 +1439,55 @@ def init_state():
     ss.setdefault("prix_km_ht", ttc_vers_ht(VRAC_PRIX_KM_TTC_DEFAUT, tl))
     ss.setdefault("date_grille", date.today())
     ss.setdefault("historique", df_vide())
+    ss.setdefault("source_grille", "Valeurs par défaut du code")
+
+
+def chemin_grille_versionnee() -> str:
+    """Chemin du fichier de grille versionné, à la racine du dépôt."""
+    try:
+        racine = os.path.dirname(os.path.abspath(__file__))
+    except NameError:
+        racine = "."
+    return os.path.join(racine, FICHIER_GRILLE_VERSIONNEE)
+
+
+def appliquer_grille(g: dict, origine: str):
+    """Remplace la grille en session par celle qui a été lue."""
+    st.session_state.update({
+        "date_grille": g["date_grille"], "palettes": g["palettes"],
+        "vrac": g["vrac"], "zones": g["zones"], "tva_march": g["tva_march"],
+        "tva_livr": g["tva_livr"], "franchise_km": g["franchise_km"],
+        "prix_km_ht": g["prix_km_ht"], "prix_km_ttc": g["prix_km_ttc"],
+        "source_grille": origine})
+
+
+def charger_grille_versionnee():
+    """
+    Au premier lancement de la session, charge grille_courante.xlsx s'il est
+    présent dans le dépôt. Repli silencieux sur les constantes s'il est absent.
+    """
+    ss = st.session_state
+    if ss.get("auto_grille_tentee"):
+        return
+    ss["auto_grille_tentee"] = True
+
+    chemin = chemin_grille_versionnee()
+    if not os.path.exists(chemin):
+        return
+
+    g, msgs = lire_grille_classeur(chemin, ss["tva_march"], ss["tva_livr"])
+    if g is None:
+        ss["auto_grille_erreur"] = msgs
+        return
+
+    horodatage = datetime.fromtimestamp(os.path.getmtime(chemin))
+    appliquer_grille(
+        g, f"{FICHIER_GRILLE_VERSIONNEE} (dépôt, maj {horodatage:%d/%m/%Y})")
+    ss["auto_grille_msgs"] = msgs
 
 
 init_state()
+charger_grille_versionnee()
 
 # ══════════════════════════════════════════════════════════════════════════════
 # STYLE
@@ -1287,6 +1562,9 @@ with st.sidebar:
     km_manuel = st.number_input("Distance retenue (km)", 0.0, 500.0, 0.0, 1.0,
                                 disabled=not forcer_km)
     st.divider()
+    st.caption(f"Grille active : **{st.session_state.get('source_grille', '—')}**  \n"
+               f"Date d'effet : "
+               f"**{pd.Timestamp(st.session_state['date_grille']):%d/%m/%Y}**")
     st.caption(f"TVA marchandise : **{taux_fmt(st.session_state['tva_march'])}** · "
                f"TVA livraison : **{taux_fmt(st.session_state['tva_livr'])}**  \n"
                "Modifiables dans l'onglet « Grille tarifaire ».")
@@ -1488,6 +1766,104 @@ with ong1:
 # ══════════════════════════════════════════════════════════════════════════════
 
 with ong2:
+    st.markdown("#### 📂 Charger une grille existante")
+
+    src = st.session_state.get("source_grille", "Valeurs par défaut du code")
+    if src.startswith(FICHIER_GRILLE_VERSIONNEE):
+        st.success(f"Grille active : **{src}** — chargée automatiquement au "
+                   "démarrage, aucune action requise.")
+    elif src == "Valeurs par défaut du code":
+        st.info("Grille active : **valeurs par défaut du code**. Déposez un "
+                f"fichier `{FICHIER_GRILLE_VERSIONNEE}` à la racine du dépôt "
+                "GitHub pour qu'elle se charge seule à chaque ouverture.")
+    else:
+        st.success(f"Grille active : **{src}**.")
+
+    for m in st.session_state.get("auto_grille_msgs", []):
+        st.caption("ℹ️ " + m)
+    for m in st.session_state.get("auto_grille_erreur", []):
+        st.warning(f"⚠️ {FICHIER_GRILLE_VERSIONNEE} présent mais non exploité : {m}")
+
+    fichier_grille = st.file_uploader(
+        "Classeur exporté par cet outil (.xlsx)", type=["xlsx", "xls"],
+        key="up_grille",
+        help="Rechargez le classeur que vous avez exporté : l'onglet « Grille "
+             "tarifaire » repeuple les prix, l'onglet « Données brutes » "
+             "l'historique concurrentiel.")
+
+    ch1, ch2 = st.columns(2)
+    with ch1:
+        charger_tarifs = st.checkbox(
+            "Charger la grille tarifaire", value=True,
+            help="Remplacement intégral : prix, zones, taux de TVA et date "
+                 "d'effet. Deux grilles ne coexistent pas.")
+    with ch2:
+        charger_histo = st.checkbox(
+            "Charger l'historique de prix", value=False,
+            help="Fusion dédoublonnée avec les relevés déjà en session. "
+                 "Rien n'est écrasé.")
+
+    if fichier_grille is not None and st.button("⬆️ Charger", type="primary",
+                                                key="btn_charger_grille"):
+        if not charger_tarifs and not charger_histo:
+            st.error("Cochez au moins l'un des deux éléments à charger.")
+        else:
+            resume = []
+            if charger_tarifs:
+                g, msgs = lire_grille_classeur(fichier_grille,
+                                               st.session_state["tva_march"],
+                                               st.session_state["tva_livr"])
+                if g is None:
+                    for m in msgs:
+                        st.error("❌ " + m)
+                else:
+                    appliquer_grille(g, f"{fichier_grille.name} (import manuel)")
+                    resume.append(
+                        f"grille du {pd.Timestamp(g['date_grille']):%d/%m/%Y} — "
+                        f"{len(g['palettes'])} palette(s), {len(g['vrac'])} palier(s) "
+                        f"vrac, {len(g['zones'])} zone(s), TVA "
+                        f"{taux_fmt(g['tva_march'])} / {taux_fmt(g['tva_livr'])}")
+                    for m in msgs:
+                        st.info("ℹ️ " + m)
+
+            if charger_histo:
+                fichier_grille.seek(0)
+                h, msgs = lire_historique_classeur(fichier_grille,
+                                                   st.session_state["tva_march"])
+                if h.empty:
+                    for m in msgs:
+                        st.warning("⚠️ " + m)
+                else:
+                    avant = len(st.session_state["historique"])
+                    st.session_state["historique"] = dedoublonner(
+                        pd.concat([st.session_state["historique"], h],
+                                  ignore_index=True),
+                        st.session_state["tva_march"])
+                    apres = len(st.session_state["historique"])
+                    resume.append(f"historique : {len(h)} ligne(s) lue(s), "
+                                  f"{apres - avant} ajoutée(s) après dédoublonnage")
+                    for m in msgs:
+                        st.info("ℹ️ " + m)
+
+            if resume:
+                st.success("Chargement effectué — " + " · ".join(resume) + ".")
+                st.rerun()
+
+    with st.expander("💡 Éviter de recharger à chaque session"):
+        st.markdown(f"""
+Le fichier que vous exportez est le fichier que vous rechargez : aucun format
+supplémentaire à maintenir.
+
+Pour supprimer ce geste manuel, déposez votre classeur à la racine du dépôt
+GitHub sous le nom exact **`{FICHIER_GRILLE_VERSIONNEE}`**. L'application le
+charge alors seule à chaque ouverture, pour tout le monde.
+
+Mettre à jour les prix devient un commit : daté, traçable, et une seule version
+fait foi. Sans ce fichier, chaque commercial recharge son propre classeur — et
+trois fichiers finissent par diverger.
+        """)
+
+    st.divider()
     st.markdown("#### 📋 Grille tarifaire en vigueur")
     st.caption("Les prix validés ici alimentent immédiatement le simulateur. "
                "Plus besoin de recoder lors d'une hausse fournisseur.")
